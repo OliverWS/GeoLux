@@ -6,43 +6,80 @@
 #include <Adafruit_MPL3115A2.h>
 #include <SPIMemory.h>
 
-const int flashCS = 5; // Chip select for Flash
+// This part just for the prototype
+#include <Adafruit_GFX.h>
+#include <Adafruit_SSD1306.h>
 
-SPIFlash flash(flashCS, &SPI); // Our Flash is on a different SPI bus
+#define SCREEN_WIDTH 128 // OLED display width, in pixels
+#define SCREEN_HEIGHT 64 // OLED display height, in pixels
+
+// Declaration for an SSD1306 display connected to I2C (SDA, SCL pins)
+Adafruit_SSD1306 display(SCREEN_WIDTH, SCREEN_HEIGHT, &Wire, -1);
+
+//----------------------------------------------------------------
+
+SPIFlash flash(A2, &SPI); // Our Flash is on a different SPI bus
 
 Adafruit_MPL3115A2 mpl;
 RTC_DS3231 rtc;
 
+uint32_t N_SAMPLES_ADDR = 0;
+uint32_t nSamples;
+
+
+
+struct DataPacket {
+  uint32_t timestamp;
+  uint16_t luminance;
+  float altitude;
+};
+
 void initFlash(){
+  Serial.println("Initializing SPI Flash");
   SPI.begin();
-  flash.begin();
+  flash.setClock(1000000);
+  flash.powerUp();
+  uint8_t err = flash.begin(MB(128));
+  Serial.printf("Initialized Flash with return code: %02x\n",err);
+
+  flash.powerUp();
   // uint8_t b1, b2, b3;
   uint32_t JEDEC = flash.getJEDECID();
-  // //uint16_t ManID = flash.getManID();
-  // b1 = (JEDEC >> 16);
-  // b2 = (JEDEC >> 8);
-  // b3 = (JEDEC >> 0);
-  Serial.println("Initializing SPI Flash");
-  // Serial.printf("Manufacturer ID: %02xh\nMemory Type: %02xh\n", b1, b2);
   Serial.printf("JEDEC_ID: %04x\n",JEDEC);
-  uint32_t cap = flash.getCapacity(); 
-  Serial.printf("Flash Capacity: %ld bytes\n",cap);
-  flash.eraseChip();
-  Serial.println("Erased Chip!");
+  Serial.print("Capacity: ");
+  Serial.println(flash.getCapacity());
+  Serial.print("Unique ID: ");
+  Serial.println(flash.getUniqueID());
+  Serial.print("Man ID: ");
+  Serial.println(flash.getManID());
+
 }
 
+
 void setup() {
-  // initialize digital pin 13 as an output.
+  pinMode(13, OUTPUT); // initialize digital pin 13 (LED) as an output.
   Serial.begin(9600);
-  while (!Serial) {
-    delay(10); // wait for serial port to connect. Needed for native USB port only
+  for(int i=0; i < 5; i ++){
+    digitalWrite(13, HIGH);   // turn the LED on (HIGH is the voltage level)
+    delay(300);              // wait for a 1/3 second
+    digitalWrite(13, LOW);    // turn the LED off by making the voltage LOW
+    delay(300);              // wait for a 1/3 second
   }
 
 
+  //Only for Prototyping
+  if(!display.begin(SSD1306_SWITCHCAPVCC, 0x3C)) { // Address 0x3D for 128x64
+    Serial.println("SSD1306 allocation failed");
+  }
+  else {
+      display.clearDisplay();
+      display.setTextSize(1);
+      display.setTextColor(WHITE);
+      display.setCursor(0, 0);
+      display.println("P123 Geolocator v0.1");
+      display.display();
 
-  pinMode(13, OUTPUT);
-
-
+  }
 
   if (! rtc.begin()) {
     Serial.println("Couldn't find RTC");
@@ -69,9 +106,26 @@ void setup() {
   // set mode before starting a conversion
   Serial.println("Setting mode to altimeter.");
   mpl.setMode(MPL3115A2_ALTIMETER);
+  mpl.setSeaPressure(1020.5);
   initFlash();
 
 
+
+}
+
+void displayStatus( char *statusStr){
+  display.clearDisplay();
+
+  display.setTextSize(1);
+  display.setTextColor(WHITE);
+  display.setCursor(0, 0);
+
+  display.println("P123 Geolocator v0.1");
+  display.setCursor(0, 20);
+  // Display static text
+
+  display.println(statusStr);
+  display.display(); 
 
 }
 
@@ -103,9 +157,9 @@ DateTime checkRTC(){
 }
 
 float checkAltimeter(){
-  float pressure = mpl.getPressure();
+  // float pressure = mpl.getPressure();
   float altitude = mpl.getAltitude();
-  float temperature = mpl.getTemperature();
+  // float temperature = mpl.getTemperature();
 
   // Serial.print("pressure = "); Serial.print(pressure); Serial.println(" hPa");
   // Serial.print("altitude = "); Serial.print(altitude); Serial.println(" m");
@@ -114,17 +168,61 @@ float checkAltimeter(){
 
 }
 
-// the loop function runs over and over again forever
-void loop() {
-  // digitalWrite(13, HIGH);   // turn the LED on (HIGH is the voltage level)
-  // delay(1000);              // wait for a second
-  // digitalWrite(13, LOW);    // turn the LED off by making the voltage LOW
-  // delay(1000);              // wait for a second
+void saveDataPoint(DataPacket packet){
+  //flash.powerUp();
+  nSamples = flash.readULong(N_SAMPLES_ADDR);
+  nSamples = nSamples + 1;
+  uint32_t _packetAddress = 10 + sizeof(DataPacket) * nSamples;
+  uint8_t code;
+  flash.eraseSection(_packetAddress, sizeof(packet));
+  code = flash.writeAnything(_packetAddress,packet);
+  Serial.printf("Wrote packet to flash, got code %d.\n",code);
+  code = flash.writeULong(N_SAMPLES_ADDR,nSamples);
+  Serial.printf("Wrote updated nSamples to flash, got code %d\n",code);
+
+  Serial.printf("Have stored %ld samples so far...\n",nSamples);
+  //flash.powerDown();
+}
+
+void exportData(){
+  for(uint32_t n=0; n < nSamples; n++){
+      uint32_t _packetAddress = 10 + sizeof(DataPacket) * n;
+      DataPacket dp;
+      flash.readAnything(_packetAddress,dp);
+      Serial.printf("Timestamp: %ld | Altitude: %0.2f meters | Light Sensor: %ld\n",dp.timestamp, dp.altitude, dp.luminance);
+
+  }
+}
+
+
+void takeMeasurement(){
+  
   analogReadResolution(12);
 
+  DataPacket dp;
   uint16_t lightSensorValue = analogRead(A0);
   DateTime dt = checkRTC();
   float altitude = checkAltimeter();
-  Serial.printf("Unix Time: %ld | Altitude: %0.2f | Analog Value: %ld\n",dt.unixtime(), altitude, lightSensorValue);
-  delay(1000);
+
+  dp.luminance = lightSensorValue;
+  dp.timestamp = dt.unixtime();
+  dp.altitude = altitude;
+  char timeStr[40];
+  sprintf(timeStr, "%d-%02d-%02dT%02d:%02d:%02d", dt.year(),dt.month(),dt.day(),dt.hour(),dt.minute(),dt.second());
+  Serial.printf("Timestamp: %s | Altitude: %0.2f meters | Light Sensor: %ld",timeStr, altitude, lightSensorValue);
+  Serial.println();
+
+  char dispStr[80];
+  sprintf(dispStr,"Date:%d-%02d-%02d\nTime: %02d:%02d:%02d\nAltitude: %0.2fm\nLight Sensor: %ld", dt.year(),dt.month(),dt.day(),dt.hour(),dt.minute(),dt.second(), altitude, lightSensorValue );
+  displayStatus(dispStr);
+
+  saveDataPoint(dp);
+
+}
+
+// the loop function runs over and over again forever
+void loop() {
+  takeMeasurement();
+  delay(60*1000*2);
+
 }
