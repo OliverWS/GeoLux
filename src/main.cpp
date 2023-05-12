@@ -3,8 +3,9 @@
 #include <SPI.h>
 #include "RTClib.h"
 #include "ArduinoLowPower.h"
-#include <Adafruit_BMP085.h>
+#include <Adafruit_BMP3XX.h>
 #include <SPIMemory.h>
+
 
 struct DataPacket {
   uint32_t timestamp;
@@ -17,6 +18,12 @@ struct CONFIG {
   float SEA_LEVEL_PRESSURE;
 };
 
+enum PROGRAM_STATE {
+  STATE_RECORDING,
+  STATE_CONFIG_MODE
+};
+
+
 uint32_t nSamples = 0;
 
 #define N_SAMPLES_ADDRESS 0
@@ -25,7 +32,7 @@ uint32_t nSamples = 0;
 
 #define DEFAULT_SAMPLE_PERIOD 10000
 
-#define DEBUG_DISPLAY true
+// #define DEBUG_DISPLAY true
 #ifdef DEBUG_DISPLAY
 
 // This part just for the prototype
@@ -35,20 +42,16 @@ uint32_t nSamples = 0;
 #define SCREEN_WIDTH 128 // OLED display width, in pixels
 #define SCREEN_HEIGHT 64 // OLED display height, in pixels
 
-enum PROGRAM_STATE {
-  STATE_RECORDING,
-  STATE_CONFIG_MODE
-};
-
 // Declaration for an SSD1306 display connected to I2C (SDA, SCL pins)
 Adafruit_SSD1306 display(SCREEN_WIDTH, SCREEN_HEIGHT, &Wire, -1);
 
 //----------------------------------------------------------------
 #endif
 
-SPIFlash flash(A2, &SPI); // Our Flash is on a different SPI bus
-Adafruit_BMP085 bmp;
+SPIFlash flash(5, &SPI); // Our Flash is on the main SPI bus
+Adafruit_BMP3XX bmp;
 RTC_DS3231 rtc;
+RTCZero rtc_internal;
 bool RESET_TIME = 0;
 volatile long lastDebounceTime = 0;
 long debounceDelay = 50;
@@ -62,35 +65,63 @@ volatile PROGRAM_STATE STATE = STATE_RECORDING;
 #define DEBUG true
 #define DEBUG_SERIAL if(DEBUG)Serial
 
+void powerUp(){
+
+
+}
+
+void powerDown(){
+
+}
+
+
+
 
 
 void initFlash(){
-  DEBUG_SERIAL.println("Initializing SPI Flash");
   SPI.begin();
-  flash.setClock(1000000);
-  flash.powerUp();
-  uint8_t err = flash.begin(MB(128));
-  DEBUG_SERIAL.printf("Initialized Flash with return code: %02x\n",err);
-  uint32_t JEDEC = flash.getJEDECID();
-  DEBUG_SERIAL.printf("JEDEC_ID: %04x\n",JEDEC);
-  DEBUG_SERIAL.print("Capacity: ");
-  DEBUG_SERIAL.println(flash.getCapacity());
-  DEBUG_SERIAL.print("Unique ID: ");
-  DEBUG_SERIAL.println(flash.getUniqueID());
-  DEBUG_SERIAL.print("Man ID: ");
-  DEBUG_SERIAL.println(flash.getManID());
 
+  uint8_t err = 0;
+  do{
+    DEBUG_SERIAL.println("Initializing SPI Flash");
+    err = flash.begin();
+    DEBUG_SERIAL.println("SPIFlash.begin()");
+    flash.powerUp();
+    DEBUG_SERIAL.println("SPIFlash.powerUp()");
+    if(err == 0){
+      //Flash init failed
+    }
+    else {
+      //flash.powerUp();
+      DEBUG_SERIAL.printf("Initialized Flash with return code: %02x\n",err);
+      uint32_t JEDEC = flash.getJEDECID();
+      DEBUG_SERIAL.printf("JEDEC_ID: %04x\n",JEDEC);
+      DEBUG_SERIAL.print("Capacity: ");
+      DEBUG_SERIAL.println(flash.getCapacity());
+      DEBUG_SERIAL.print("Unique ID: ");
+      DEBUG_SERIAL.println(flash.getUniqueID());
+      DEBUG_SERIAL.print("Man ID: ");
+      DEBUG_SERIAL.println(flash.getManID());
+    }
+    delay(1000);
+
+  }
+  while(err == 0);
 }
 
 
 void button_pressed(){
   if ((millis() - lastDebounceTime) > debounceDelay) {
-    // whatever the reading is at, it's been there for longer
-    // than the debounce delay, so take it as the actual current state:
     if((millis() - lastDebounceTime) < 1000){
-      Serial.println("Button double clicked: Switching to config mode");
-      STATE = STATE_CONFIG_MODE;
-      configModeTimeoutCounter = millis();
+      if( STATE == STATE_RECORDING){
+        Serial.println("Button double clicked: Switching to config mode");
+        STATE = STATE_CONFIG_MODE;
+        configModeTimeoutCounter = millis();
+      }
+      else {
+        Serial.println("Button double clicked: Switching to RECORDING mode");
+        STATE = STATE_RECORDING;
+      }
     }
     else {
       Serial.println("Button pressed!");
@@ -107,20 +138,22 @@ void initRTC(){
     DEBUG_SERIAL.flush();
     while (1) delay(10);
   }
+  else {
+    rtc.disable32K();
+    rtc.writeSqwPinMode(DS3231_OFF);
+  }
 
-  rtc.disable32K();
-  rtc.writeSqwPinMode(DS3231_OFF);
 }
 
 void initAltimeter(){
 
-  if (!bmp.begin()) {
+  if (!bmp.begin_I2C()) {
     DEBUG_SERIAL.println("Could not find sensor. Check wiring.");
     while(1);
   }
-
-  DEBUG_SERIAL.println("Setting mode to altimeter.");
-  
+  // bmp.setPressureOversampling(BMP3_OVERSAMPLING_4X);
+  // bmp.setIIRFilterCoeff(BMP3_IIR_FILTER_COEFF_3);
+  bmp.setOutputDataRate(BMP3_ODR_0_05_HZ);  
 
 }
 #ifdef DEBUG_DISPLAY
@@ -142,17 +175,22 @@ void initDisplay(){
 }
 #endif
 
+void printConfig(){
+  Serial.printf("Sample Period: %d seconds\nSea Level Pressure: %0.2f\nCurrent Time: %s\n",config.SAMPLE_PERIOD/1000,config.SEA_LEVEL_PRESSURE,rtc.now().timestamp().c_str());
+}
+
 void loadConfig(){
   flash.powerUp();
   flash.readAnything(CONFIG_DATA_ADDRESS,config);
-  if(config.SAMPLE_PERIOD == NAN || config.SAMPLE_PERIOD < 100){
+  if(config.SAMPLE_PERIOD == NAN || config.SAMPLE_PERIOD < 100 || config.SAMPLE_PERIOD > 1000*10*60){
     config.SAMPLE_PERIOD = DEFAULT_SAMPLE_PERIOD;
   }
 
-  if(config.SEA_LEVEL_PRESSURE == NAN){
+  if(config.SEA_LEVEL_PRESSURE == NAN || config.SEA_LEVEL_PRESSURE == -NAN){
     config.SEA_LEVEL_PRESSURE = 1020.20;
   }
   flash.powerDown();
+  printConfig();
 }
 
 void saveConfig(CONFIG config){
@@ -180,6 +218,7 @@ void setup() {
     digitalWrite(13, LOW);    // turn the LED off by making the voltage LOW
     delay(300);              // wait for a 1/3 second
   }
+
   #ifdef DEBUG_DISPLAY
   initDisplay(); // Only for Debugging Purposes
   #endif
@@ -192,6 +231,19 @@ void setup() {
 
   attachInterrupt(digitalPinToInterrupt(6), button_pressed, FALLING);
   LowPower.attachInterruptWakeup(6, button_pressed, FALLING);
+  delay(15000); //Wait 15 seconds before disabling everything including USB
+
+  // setup timer counter
+  powerDown();
+  for (size_t i = 0; i < 5; i++)
+  {
+    digitalWrite(13, HIGH);   // turn the LED on (HIGH is the voltage level)
+    delay(150);              // wait for a 1/3 second
+    digitalWrite(13, LOW);    // turn the LED off by making the voltage LOW
+    delay(150);              // wait for a 1/3 second
+  }
+  digitalWrite(13, HIGH);   // turn the LED on (HIGH is the voltage level)
+
 
 }
 #ifdef DEBUG_DISPLAY
@@ -212,12 +264,17 @@ void displayStatus( char *statusStr){
 }
 #endif
 DateTime checkRTC(){
-  return rtc.now();
+  if(rtc.begin()){
+    return rtc.now();
+  }
+  else {
+    return DateTime(rtc_internal.getEpoch());
+  }
 }
 
 
 float checkAltimeter(){
-  float altitude = bmp.readAltitude(config.SEA_LEVEL_PRESSURE*100);
+  float altitude = bmp.readAltitude(config.SEA_LEVEL_PRESSURE);
   return altitude;
 }
 
@@ -227,9 +284,15 @@ void saveDataPoint(DataPacket packet){
   nSamples = flash.readULong(N_SAMPLES_ADDRESS) + 1;
 
   uint32_t _packetAddress = 4096 + sizeof(DataPacket) * nSamples;
+  int tryCount = 0;
   while(!flash.writeAnything(_packetAddress,packet)){ 
     DEBUG_SERIAL.printf("Erasing sector: %ld\n",_packetAddress);
-    flash.eraseSection(_packetAddress,sizeof(DataPacket));
+    flash.eraseBlock64K(_packetAddress);
+    delay(100);
+    tryCount++;
+    if(tryCount > 10){
+      NVIC_SystemReset();   
+    }
   }
   DEBUG_SERIAL.printf("Have stored %ld samples so far...\n",nSamples);
   flash.eraseSection(0,sizeof(nSamples) + sizeof(CONFIG));
@@ -256,6 +319,7 @@ void exportData(){
 
 
 void takeMeasurement(){
+
   uint32_t sampleStartTime = millis();
   analogReadResolution(12);
 
@@ -326,10 +390,6 @@ void setSeaLevelPressure(){
 }
 
 
-void printConfig(){
-  Serial.printf("Sample Period: %d seconds\nSea Level Pressure: %0.2f\nCurrent Time: %s\n",config.SAMPLE_PERIOD/1000,config.SEA_LEVEL_PRESSURE,rtc.now().timestamp());
-}
-
 void printConfigHelp(){
   Serial.println("Available Commands:");
   for(int i=0; i < 80; i++) Serial.print("-");
@@ -343,10 +403,25 @@ void printConfigHelp(){
   Serial.println();
 }
 
+void eraseData(){
+  flash.powerUp();
+  nSamples = 0;
+  flash.eraseSection(0,sizeof(nSamples) + sizeof(CONFIG));
+  if(flash.writeULong(N_SAMPLES_ADDRESS,nSamples) && flash.writeAnything(CONFIG_DATA_ADDRESS,config)){
+    DEBUG_SERIAL.printf("Wrote updated nSamples %ld to Flash\n",nSamples);
+  }
+  flash.powerDown();
+
+}
+
 // the loop function runs over and over again forever
 void loop() {
+  powerUp();
+  DEBUG_SERIAL.println("At start of loop...");
   if(STATE == STATE_CONFIG_MODE){
-    Serial.setTimeout(CONFIG_MODE_TIMEOUT);
+    Serial.flush();
+    Serial.setTimeout(60000);
+    DEBUG_SERIAL.println("Waiting for command...");
     String cmdStr = Serial.readStringUntil('\n');
     if(cmdStr.length() > 0){
       configModeTimeoutCounter = millis();
@@ -362,6 +437,9 @@ void loop() {
     }
     else if(cmdStr == "EXPORT_DATA"){
       exportData();
+    }
+    else if(cmdStr == "ERASE"){
+      eraseData();
     }
     else if(cmdStr == "PRINT_CONFIG"){
       printConfig();
@@ -379,8 +457,12 @@ void loop() {
     }
   }
   else {
+    digitalWrite(13, LOW);    
     takeMeasurement();
+    digitalWrite(13, HIGH);    
+    powerDown();
     LowPower.deepSleep(config.SAMPLE_PERIOD);
+
   }
 
 }
