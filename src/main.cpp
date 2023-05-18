@@ -9,10 +9,19 @@
 #include <Adafruit_SPIFlash.h>
 #include <flash_devices.h>
 #include <ArduinoJson.h>
+enum PROGRAM_STATE {
+  STATE_RECORDING,
+  STATE_CONFIG_MODE
+};
 
-bool was_mounted = false;
+volatile PROGRAM_STATE STATE = STATE_RECORDING;
+
+void tud_mount_cb(void) {
+    STATE = STATE_CONFIG_MODE;
+}
+
 void tud_umount_cb(void) {
-    was_mounted  = true;
+    STATE = STATE_RECORDING;
 }
 
 static const SPIFlash_Device_t possible_devices[] = {W25Q128JV_PM};
@@ -42,10 +51,6 @@ struct CONFIG {
   float SEA_LEVEL_PRESSURE;
 };
 
-enum PROGRAM_STATE {
-  STATE_RECORDING,
-  STATE_CONFIG_MODE
-};
 
 
 uint32_t nSamples = 0;
@@ -84,7 +89,6 @@ uint32_t last_time_update = 0;
 long configModeTimeoutCounter = 0;
 CONFIG config;
 
-volatile PROGRAM_STATE STATE = STATE_RECORDING;
 
 #define DEBUG true
 #define DEBUG_SERIAL if(DEBUG)Serial
@@ -558,8 +562,11 @@ void eraseData(){
 // the loop function runs over and over again forever
 void loop() {
 
-  if (tud_ready()) { 
+  if (STATE == STATE_CONFIG_MODE) { 
     digitalWrite(13, LOW);    
+    delay(300);
+    digitalWrite(13, HIGH);  
+    delay(300);  
   } else {
       digitalWrite(13, LOW);    
       takeMeasurement();
