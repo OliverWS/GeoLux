@@ -27,7 +27,17 @@
 			"string_view": "cpp",
 			"unordered_map": "cpp",
 			"unordered_set": "cpp",
-			"vector": "cpp"
+			"vector": "cpp",
+			"*.backup": "cpp",
+			"functional": "cpp",
+			"format": "cpp",
+			"iterator": "cpp",
+			"locale": "cpp",
+			"queue": "cpp",
+			"random": "cpp",
+			"*.tcc": "cpp",
+			"memory": "cpp",
+			"mutex": "cpp"
 		}
 	}
 }

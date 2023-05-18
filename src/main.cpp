@@ -1,10 +1,34 @@
+#include <Adafruit_TinyUSB.h>
 #include <Arduino.h>
 #include <Wire.h>
 #include <SPI.h>
 #include "RTClib.h"
 #include "ArduinoLowPower.h"
 #include <Adafruit_BMP3XX.h>
-#include <SPIMemory.h>
+#include <SdFat.h>
+#include <Adafruit_SPIFlash.h>
+#include <flash_devices.h>
+#include <ArduinoJson.h>
+
+bool was_mounted = false;
+void tud_umount_cb(void) {
+    was_mounted  = true;
+}
+
+static const SPIFlash_Device_t possible_devices[] = {W25Q128JV_PM};
+Adafruit_FlashTransport_SPI flashTransport(5, &SPI);
+Adafruit_SPIFlash flash(&flashTransport);
+
+// file system object from SdFat
+FatVolume fatfs;
+Adafruit_USBD_MSC usb_msc;
+bool fs_changed = false;
+uint32_t timeSinceLastUpdate = 0;
+
+// Configuration for the datalogging file:
+#define FILE_NAME      "data.csv"
+#define CONFIG_FILE_NAME      "config.json"
+#define TIME_FILE_NAME "current_time.txt"
 
 
 struct DataPacket {
@@ -14,7 +38,7 @@ struct DataPacket {
 };
 
 struct CONFIG {
-  uint32_t SAMPLE_PERIOD;
+  uint16_t SAMPLE_PERIOD;
   float SEA_LEVEL_PRESSURE;
 };
 
@@ -48,7 +72,6 @@ Adafruit_SSD1306 display(SCREEN_WIDTH, SCREEN_HEIGHT, &Wire, -1);
 //----------------------------------------------------------------
 #endif
 
-SPIFlash flash(5, &SPI); // Our Flash is on the main SPI bus
 Adafruit_BMP3XX bmp;
 RTC_DS3231 rtc;
 RTCZero rtc_internal;
@@ -56,6 +79,7 @@ bool RESET_TIME = 0;
 volatile long lastDebounceTime = 0;
 long debounceDelay = 50;
 uint32_t SAMPLE_PERIOD = 10000;
+uint32_t last_time_update = 0;
 
 long configModeTimeoutCounter = 0;
 CONFIG config;
@@ -77,36 +101,181 @@ void powerDown(){
 
 
 
+// Callback invoked when received READ10 command.
+// Copy disk's data to buffer (up to bufsize) and 
+// return number of copied bytes (must be multiple of block size) 
+int32_t msc_read_cb (uint32_t lba, void* buffer, uint32_t bufsize)
+{
+  // Note: SPIFLash Block API: readBlocks/writeBlocks/syncBlocks
+  // already include 4K sector caching internally. We don't need to cache it, yahhhh!!
+  return flash.readBlocks(lba, (uint8_t*) buffer, bufsize/512) ? bufsize : -1;
+}
 
-void initFlash(){
-  SPI.begin();
+// Callback invoked when received WRITE10 command.
+// Process data in buffer to disk's storage and 
+// return number of written bytes (must be multiple of block size)
+int32_t msc_write_cb (uint32_t lba, uint8_t* buffer, uint32_t bufsize)
+{
+  digitalWrite(LED_BUILTIN, HIGH);
 
-  uint8_t err = 0;
-  do{
-    DEBUG_SERIAL.println("Initializing SPI Flash");
-    err = flash.begin();
-    DEBUG_SERIAL.println("SPIFlash.begin()");
-    flash.powerUp();
-    DEBUG_SERIAL.println("SPIFlash.powerUp()");
-    if(err == 0){
-      //Flash init failed
+  // Note: SPIFLash Block API: readBlocks/writeBlocks/syncBlocks
+  // already include 4K sector caching internally. We don't need to cache it, yahhhh!!
+  return flash.writeBlocks(lba, buffer, bufsize/512) ? bufsize : -1;
+}
+
+void dateTime(uint16_t* date, uint16_t* time) {
+  // return date using FAT_DATE macro to format fields
+  *date = FAT_DATE(rtc_internal.getYear(), rtc_internal.getMonth(), rtc_internal.getDay());
+
+  // return time using FAT_TIME macro to format fields
+  *time = FAT_TIME(rtc_internal.getHours(), rtc_internal.getMinutes(), rtc_internal.getSeconds());
+}
+
+DateTime convert_fatfs_time(uint16_t fdate, uint16_t ftime) {
+  uint16_t year;
+  uint8_t month, day, hours, minutes, seconds;
+  // The year is stored as an offset from 1980.
+  year = (fdate >> 9) + 1980;
+
+  // The month is stored as a value from 1 to 12.
+  month = (fdate >> 5) & 0x0f;
+
+  // The day is stored as a value from 1 to 31.
+  day = fdate & 0x1f;
+
+  // The hours are stored as a value from 0 to 23.
+  hours = (ftime >> 11) & 0x1f;
+
+  // The minutes are stored as a value from 0 to 59.
+  minutes = (ftime >> 5) & 0x3f;
+
+  // The seconds are stored as a value from 0 to 59.
+  seconds = ftime & 0x1f;
+
+  return DateTime(year,month,day,hours,minutes,seconds);
+}
+
+
+
+void loadConfig(){
+  if(fatfs.exists(CONFIG_FILE_NAME)){
+    DEBUG_SERIAL.println("Found existing configuration file!");
+    StaticJsonDocument<JSON_OBJECT_SIZE(10)> doc;
+    File32 configFile = fatfs.open(CONFIG_FILE_NAME);
+    // Deserialize the JSON document
+    DeserializationError error = deserializeJson(doc, configFile);
+    if (error){
+      Serial.println(F("Failed to read file, using default configuration"));
+      Serial.printf("Error: %s\n",error.c_str());
     }
     else {
-      //flash.powerUp();
-      DEBUG_SERIAL.printf("Initialized Flash with return code: %02x\n",err);
-      uint32_t JEDEC = flash.getJEDECID();
-      DEBUG_SERIAL.printf("JEDEC_ID: %04x\n",JEDEC);
-      DEBUG_SERIAL.print("Capacity: ");
-      DEBUG_SERIAL.println(flash.getCapacity());
-      DEBUG_SERIAL.print("Unique ID: ");
-      DEBUG_SERIAL.println(flash.getUniqueID());
-      DEBUG_SERIAL.print("Man ID: ");
-      DEBUG_SERIAL.println(flash.getManID());
-    }
-    delay(1000);
+      Serial.println(F("Decoded config file: "));
+      serializeJsonPretty(doc, Serial);
+      Serial.println();
 
+    }
+    
+    // Copy values from the JsonDocument to the Config
+    config.SAMPLE_PERIOD = doc["SAMPLE_PERIOD"].as<uint16_t>();
+    Serial.printf("Setting Sample Period: %d\n",doc["SAMPLE_PERIOD"].as<uint16_t>());
+    config.SEA_LEVEL_PRESSURE = doc["SEA_LEVEL_PRESSURE"].as<float>();
+    Serial.printf("Setting Pressure: %f\n",doc["SEA_LEVEL_PRESSURE"].as<float>());
+
+    // Close the file (Curiously, File's destructor doesn't close the file)
+    configFile.close();
+    
   }
-  while(err == 0);
+  else {
+    DEBUG_SERIAL.println("Config file missing, creating!");
+
+    config.SAMPLE_PERIOD = 10;
+    config.SEA_LEVEL_PRESSURE = 1020.20;
+    File32 configFile = fatfs.open(CONFIG_FILE_NAME,FILE_WRITE);
+    const size_t CAPACITY = JSON_OBJECT_SIZE(4);
+    StaticJsonDocument<CAPACITY> doc;
+    doc["SAMPLE_PERIOD"] = config.SAMPLE_PERIOD;
+    doc["SEA_LEVEL_PRESSURE"] = config.SEA_LEVEL_PRESSURE;
+    serializeJson(doc, configFile);
+    configFile.close();
+  }
+//hard code for now
+config.SAMPLE_PERIOD = 120;
+config.SEA_LEVEL_PRESSURE = 1020.20;
+}
+
+void updateTimeFromFile(void){
+  timeSinceLastUpdate = millis();
+  if(fatfs.exists(TIME_FILE_NAME)){
+    File32 conf_file = fatfs.open(TIME_FILE_NAME);
+    uint16_t cdate; 
+    uint16_t ctime;
+    conf_file.getCreateDateTime(&cdate,&ctime);
+    conf_file.close();
+    DateTime now = convert_fatfs_time(cdate,ctime);
+    DEBUG_SERIAL.printf("Updating time to: %s\n",now.timestamp().c_str());
+    rtc_internal.setDate(now.day(),now.month(),(uint8_t) (now.year()-2000));
+    rtc_internal.setTime(now.hour(),now.minute(),now.second());
+    //rtc.adjust(now);
+    delay(1000);
+    fatfs.remove(TIME_FILE_NAME);
+  }else {
+    loadConfig();
+  }
+}
+// Callback invoked when WRITE10 command is completed (status received and accepted by host).
+// used to flush any pending cache.
+void msc_flush_cb (void)
+{
+  // sync with flash
+  flash.syncBlocks();
+
+  // clear file system's cache to force refresh
+  fatfs.cacheClear();
+
+  fs_changed = true;
+  if((millis() - timeSinceLastUpdate) > 10000){
+    updateTimeFromFile();
+  }
+
+  digitalWrite(LED_BUILTIN, LOW);
+}
+
+void initMassStorage(){
+  // Set disk vendor id, product id and revision with string up to 8, 16, 4 characters respectively
+  usb_msc.setID("Adafruit", "External Flash", "1.0");
+
+  // Set callback
+  usb_msc.setReadWriteCallback(msc_read_cb, msc_write_cb, msc_flush_cb);
+  
+  // Set disk size, block size should be 512 regardless of spi flash page size
+  usb_msc.setCapacity(flash.size()/512, 512);
+
+  // MSC is ready for read/write
+  usb_msc.setUnitReady(true);
+
+  usb_msc.begin();
+
+}
+
+
+void initFlash(){
+
+  if (!flash.begin(possible_devices)) {
+    DEBUG_SERIAL.println("Error, failed to initialize flash chip!");
+    while(1) delay(100);
+  }
+  DEBUG_SERIAL.print("Flash chip JEDEC ID: 0x"); Serial.println(flash.getJEDECID(), HEX);
+
+  // First call begin to mount the filesystem.  Check that it returns true
+  // to make sure the filesystem was mounted.
+  while (!fatfs.begin(&flash)) {
+    DEBUG_SERIAL.println("Error, failed to mount newly formatted filesystem!");
+    DEBUG_SERIAL.println("Was the flash chip formatted with the fatfs_format example?");
+    delay(1000);
+  }
+  DEBUG_SERIAL.println("Mounted filesystem!");
+  initMassStorage();
+  
 }
 
 
@@ -134,9 +303,8 @@ void button_pressed(){
 void initRTC(){
 
   if (! rtc.begin()) {
-    DEBUG_SERIAL.println("Couldn't find RTC");
-    DEBUG_SERIAL.flush();
-    while (1) delay(10);
+    DEBUG_SERIAL.println("Couldn't find RTC, using internal");
+    rtc_internal.begin();
   }
   else {
     rtc.disable32K();
@@ -176,43 +344,22 @@ void initDisplay(){
 #endif
 
 void printConfig(){
-  Serial.printf("Sample Period: %d seconds\nSea Level Pressure: %0.2f\nCurrent Time: %s\n",config.SAMPLE_PERIOD/1000,config.SEA_LEVEL_PRESSURE,rtc.now().timestamp().c_str());
-}
-
-void loadConfig(){
-  flash.powerUp();
-  flash.readAnything(CONFIG_DATA_ADDRESS,config);
-  if(config.SAMPLE_PERIOD == NAN || config.SAMPLE_PERIOD < 100 || config.SAMPLE_PERIOD > 1000*10*60){
-    config.SAMPLE_PERIOD = DEFAULT_SAMPLE_PERIOD;
-  }
-
-  if(config.SEA_LEVEL_PRESSURE == NAN || config.SEA_LEVEL_PRESSURE == -NAN){
-    config.SEA_LEVEL_PRESSURE = 1020.20;
-  }
-  flash.powerDown();
-  printConfig();
+  Serial.printf("Sample Period: %d seconds\nSea Level Pressure: %0.2f\nCurrent Time: %s\n",config.SAMPLE_PERIOD,config.SEA_LEVEL_PRESSURE,rtc.now().timestamp().c_str());
 }
 
 void saveConfig(CONFIG config){
-    flash.powerUp();
-    nSamples = flash.readULong(N_SAMPLES_ADDRESS);
-    flash.eraseSection(0,sizeof(nSamples) + sizeof(CONFIG));
-    if(flash.writeULong(N_SAMPLES_ADDRESS,nSamples) && flash.writeAnything(CONFIG_DATA_ADDRESS,config)){
-      DEBUG_SERIAL.println("Configuration saved to flash succesfully");
-    }
-    else {
-      DEBUG_SERIAL.println("ERROR: Saving configuration to flash failed!");
-    }
-    flash.powerDown();
+  //Do nothing
 }
 
 
 void setup() {
   pinMode(13, OUTPUT); // initialize digital pin 13 (LED) as an output.
+  initFlash();
   #if DEBUG == true
   Serial.begin(9600);
+  delay(3000);
   #endif 
-  for(int i=0; i < 5; i ++){
+  for(int i=0; i < 10; i ++){
     digitalWrite(13, HIGH);   // turn the LED on (HIGH is the voltage level)
     delay(300);              // wait for a 1/3 second
     digitalWrite(13, LOW);    // turn the LED off by making the voltage LOW
@@ -224,17 +371,15 @@ void setup() {
   #endif
   initRTC();
   initAltimeter();
-  initFlash();
+  
 
   pinMode(6, INPUT_PULLUP);
   loadConfig();
 
   attachInterrupt(digitalPinToInterrupt(6), button_pressed, FALLING);
   LowPower.attachInterruptWakeup(6, button_pressed, FALLING);
-  delay(15000); //Wait 15 seconds before disabling everything including USB
 
   // setup timer counter
-  powerDown();
   for (size_t i = 0; i < 5; i++)
   {
     digitalWrite(13, HIGH);   // turn the LED on (HIGH is the voltage level)
@@ -279,42 +424,39 @@ float checkAltimeter(){
 }
 
 
-void saveDataPoint(DataPacket packet){
-  flash.powerUp();
-  nSamples = flash.readULong(N_SAMPLES_ADDRESS) + 1;
-
-  uint32_t _packetAddress = 4096 + sizeof(DataPacket) * nSamples;
-  int tryCount = 0;
-  while(!flash.writeAnything(_packetAddress,packet)){ 
-    DEBUG_SERIAL.printf("Erasing sector: %ld\n",_packetAddress);
-    flash.eraseBlock64K(_packetAddress);
-    delay(100);
-    tryCount++;
-    if(tryCount > 10){
-      NVIC_SystemReset();   
+void saveDataPoint(DataPacket dp){
+  bool initializeFile = !fatfs.exists(FILE_NAME);
+  FsDateTime::setCallback(&dateTime);
+  File32 dataFile = fatfs.open(FILE_NAME, FILE_WRITE);
+  // Check that the file opened successfully and write a line to it.
+  if (dataFile) {
+    if(initializeFile){
+      dataFile.print("Timestamp,Altitude(m),Light Sensor\r\n");
     }
+    dataFile.printf("%s,%0.2f,%ld\r\n",DateTime(dp.timestamp).timestamp().c_str(), dp.altitude, dp.luminance);
+
+    dataFile.close();
+    Serial.println("Wrote new measurement to data file!");
   }
-  DEBUG_SERIAL.printf("Have stored %ld samples so far...\n",nSamples);
-  flash.eraseSection(0,sizeof(nSamples) + sizeof(CONFIG));
-  if(flash.writeULong(N_SAMPLES_ADDRESS,nSamples) && flash.writeAnything(CONFIG_DATA_ADDRESS,config)){
-    DEBUG_SERIAL.printf("Wrote updated nSamples %ld to Flash\n",nSamples);
+  else {
+    Serial.println("Failed to open data file for writing!");
   }
-  flash.powerDown();
+
 
 }
 
 void exportData(){
-  flash.powerUp();
-  nSamples = flash.readULong(N_SAMPLES_ADDRESS);  
+  // flash.powerUp();
+  // nSamples = flash.readULong(N_SAMPLES_ADDRESS);  
 
-  Serial.printf("Timestamp,Altitude(m),Light Sensor\r\n");
-  for(uint32_t n=0; n < nSamples; n++){
-      uint32_t _packetAddress = 4096 + sizeof(DataPacket) * n;
-      DataPacket dp;
-      flash.readAnything(_packetAddress,dp);
-      Serial.printf("%s,%0.2f,%ld\r\n",DateTime(dp.timestamp).timestamp().c_str(), dp.altitude, dp.luminance);
-  }
-  flash.powerDown();
+  // Serial.printf("Timestamp,Altitude(m),Light Sensor\r\n");
+  // for(uint32_t n=0; n < nSamples; n++){
+  //     uint32_t _packetAddress = 4096 + sizeof(DataPacket) * n;
+  //     DataPacket dp;
+  //     flash.readAnything(_packetAddress,dp);
+  //     Serial.printf("%s,%0.2f,%ld\r\n",DateTime(dp.timestamp).timestamp().c_str(), dp.altitude, dp.luminance);
+  // }
+  // flash.powerDown();
 }
 
 
@@ -354,9 +496,15 @@ void setConfigTime(){
   Serial.println("Enter current time as an ISO8601 string (e.g. 2023-04-30T13:21:00):");
   String isoTimeStr = Serial.readStringUntil('\n');
   const char *isoTime = isoTimeStr.c_str();
+  DateTime now = DateTime(isoTime);
   rtc.adjust(DateTime(isoTime));
+  rtc_internal.setDate(now.day(),now.month(),now.year());
+  rtc_internal.setTime(now.hour(),now.minute(),now.second());
+
   delay(500);
-  Serial.printf("\nCurrent Time is now: %s\n", rtc.now().timestamp().c_str());
+  Serial.printf("\nCurrent Time (external) is now: %s\n", rtc.now().timestamp().c_str());
+  Serial.printf("\nCurrent Time (internal) is now: %d-%02d-%02dT%02d:%02d:%02d\n", rtc_internal.getYear(),rtc_internal.getMonth(),rtc_internal.getDay(),rtc_internal.getHours(),rtc_internal.getMinutes(),rtc_internal.getSeconds());
+
 }
 
 void setSampleInterval(){
@@ -404,65 +552,30 @@ void printConfigHelp(){
 }
 
 void eraseData(){
-  flash.powerUp();
-  nSamples = 0;
-  flash.eraseSection(0,sizeof(nSamples) + sizeof(CONFIG));
-  if(flash.writeULong(N_SAMPLES_ADDRESS,nSamples) && flash.writeAnything(CONFIG_DATA_ADDRESS,config)){
-    DEBUG_SERIAL.printf("Wrote updated nSamples %ld to Flash\n",nSamples);
-  }
-  flash.powerDown();
+  // flash.powerUp();
+  // nSamples = 0;
+  // flash.eraseSection(0,sizeof(nSamples) + sizeof(CONFIG));
+  // if(flash.writeULong(N_SAMPLES_ADDRESS,nSamples) && flash.writeAnything(CONFIG_DATA_ADDRESS,config)){
+  //   DEBUG_SERIAL.printf("Wrote updated nSamples %ld to Flash\n",nSamples);
+  // }
+  // flash.powerDown();
 
 }
 
 // the loop function runs over and over again forever
 void loop() {
-  powerUp();
-  DEBUG_SERIAL.println("At start of loop...");
-  if(STATE == STATE_CONFIG_MODE){
-    Serial.flush();
-    Serial.setTimeout(60000);
-    DEBUG_SERIAL.println("Waiting for command...");
-    String cmdStr = Serial.readStringUntil('\n');
-    if(cmdStr.length() > 0){
-      configModeTimeoutCounter = millis();
-    }
-    if(cmdStr == "SET_TIME"){
-      setConfigTime();
-    }
-    else if(cmdStr == "SET_SAMPLE_INTERVAL"){
-      setSampleInterval();
-    }
-    else if (cmdStr == "SET_SEA_LEVEL_PRESSURE"){
-      setSeaLevelPressure();
-    }
-    else if(cmdStr == "EXPORT_DATA"){
-      exportData();
-    }
-    else if(cmdStr == "ERASE"){
-      eraseData();
-    }
-    else if(cmdStr == "PRINT_CONFIG"){
-      printConfig();
-    }
-    else if(cmdStr == "EXIT"){
-      STATE = STATE_RECORDING;
-    }
-    else {
-      printConfigHelp();
-    }
 
-
-    if((millis() - configModeTimeoutCounter) > CONFIG_MODE_TIMEOUT){
-      STATE = STATE_RECORDING;
-    }
+  if (tud_ready()) { 
+      /* Do nothing here - PC is connected*/
+  } else {
+      was_mounted = false;
+      digitalWrite(13, LOW);    
+      takeMeasurement();
+      digitalWrite(13, HIGH);    
+      LowPower.deepSleep(config.SAMPLE_PERIOD);
   }
-  else {
-    digitalWrite(13, LOW);    
-    takeMeasurement();
-    digitalWrite(13, HIGH);    
-    powerDown();
-    LowPower.deepSleep(config.SAMPLE_PERIOD);
 
-  }
+
 
 }
+
