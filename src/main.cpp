@@ -566,13 +566,12 @@ void eraseData(){
 void loop() {
 
   if (tud_ready()) { 
-      /* Do nothing here - PC is connected*/
+    digitalWrite(13, LOW);    
   } else {
-      was_mounted = false;
       digitalWrite(13, LOW);    
       takeMeasurement();
       digitalWrite(13, HIGH);    
-      LowPower.deepSleep(config.SAMPLE_PERIOD);
+      LowPower.deepSleep(config.SAMPLE_PERIOD*1000);
   }
 
 
