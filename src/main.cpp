@@ -282,15 +282,8 @@ void initFlash(){
 void button_pressed(){
   if ((millis() - lastDebounceTime) > debounceDelay) {
     if((millis() - lastDebounceTime) < 1000){
-      if( STATE == STATE_RECORDING){
-        Serial.println("Button double clicked: Switching to config mode");
-        STATE = STATE_CONFIG_MODE;
-        configModeTimeoutCounter = millis();
-      }
-      else {
-        Serial.println("Button double clicked: Switching to RECORDING mode");
-        STATE = STATE_RECORDING;
-      }
+        Serial.println("Button double clicked: Resetting");
+        NVIC_SystemReset();   
     }
     else {
       Serial.println("Button pressed!");
