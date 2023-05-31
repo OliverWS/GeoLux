@@ -6,6 +6,10 @@
 		{
 			"name": "Light Level Geolocator",
 			"path": ".."
+		},
+		{
+			"name": "GPS Testbed",
+			"path": "../../GPS Testbed"
 		}
 	],
 	"settings": {
