@@ -5,22 +5,31 @@
 #include "RTClib.h"
 #include "ArduinoLowPower.h"
 #include <Adafruit_BMP3XX.h>
+#include <SparkFun_RV8803.h>
+#include "Adafruit_VEML7700.h"
 #include <SdFat.h>
 #include <Adafruit_SPIFlash.h>
 #include <flash_devices.h>
 #include <ArduinoJson.h>
+
 enum PROGRAM_STATE {
   STATE_RECORDING,
   STATE_CONFIG_MODE
 };
 
+long configTime = 0;
+
 volatile PROGRAM_STATE STATE = STATE_RECORDING;
 
 void tud_mount_cb(void) {
     STATE = STATE_CONFIG_MODE;
+    configTime = millis();
 }
 
 void tud_umount_cb(void) {
+    STATE = STATE_RECORDING;
+}
+void tud_suspend_cb(void){
     STATE = STATE_RECORDING;
 }
 
@@ -42,8 +51,9 @@ uint32_t timeSinceLastUpdate = 0;
 
 struct DataPacket {
   uint32_t timestamp;
-  uint16_t luminance;
+  float luminance;
   float altitude;
+  float temperature;
 };
 
 struct CONFIG {
@@ -78,7 +88,8 @@ Adafruit_SSD1306 display(SCREEN_WIDTH, SCREEN_HEIGHT, &Wire, -1);
 #endif
 
 Adafruit_BMP3XX bmp;
-RTC_DS3231 rtc;
+Adafruit_VEML7700 veml = Adafruit_VEML7700();
+RV8803 rtc;
 RTCZero rtc_internal;
 bool RESET_TIME = 0;
 volatile long lastDebounceTime = 0;
@@ -103,6 +114,24 @@ void powerDown(){
 }
 
 
+void powerOnSelfTest(){
+  
+  Serial.println("Checking VEML7700....");
+  Serial.printf("Current LUX: %0.2f\n",veml.readLux(VEML_LUX_AUTO));
+  Serial.printf("Current Altitude is %0.2f meters\n",bmp.readAltitude(1020.20));
+  Serial.printf("Current Temperature is %0.2fC\n",bmp.readTemperature());
+
+  Serial.println("Checking RTC...");
+  if(rtc.updateTime()){
+    Serial.print("Current RTC Time is: ");
+    Serial.println(rtc.stringTime8601());
+  }
+  else {
+    Serial.println("RTC connection FAILED");
+  }
+  
+
+}
 
 
 // Callback invoked when received READ10 command.
@@ -120,7 +149,7 @@ int32_t msc_read_cb (uint32_t lba, void* buffer, uint32_t bufsize)
 // return number of written bytes (must be multiple of block size)
 int32_t msc_write_cb (uint32_t lba, uint8_t* buffer, uint32_t bufsize)
 {
-  digitalWrite(LED_BUILTIN, HIGH);
+  digitalWrite(LED_BUILTIN, LOW);
 
   // Note: SPIFLash Block API: readBlocks/writeBlocks/syncBlocks
   // already include 4K sector caching internally. We don't need to cache it, yahhhh!!
@@ -129,10 +158,11 @@ int32_t msc_write_cb (uint32_t lba, uint8_t* buffer, uint32_t bufsize)
 
 void dateTime(uint16_t* date, uint16_t* time) {
   // return date using FAT_DATE macro to format fields
-  *date = FAT_DATE(rtc_internal.getYear(), rtc_internal.getMonth(), rtc_internal.getDay());
+  rtc.updateTime();
+  *date = FAT_DATE(rtc.getYear(), rtc.getMonth(), rtc.getDate());
 
   // return time using FAT_TIME macro to format fields
-  *time = FAT_TIME(rtc_internal.getHours(), rtc_internal.getMinutes(), rtc_internal.getSeconds());
+  *time = FAT_TIME(rtc.getHours(), rtc.getMinutes(), rtc.getSeconds());
 }
 
 DateTime convert_fatfs_time(uint16_t fdate, uint16_t ftime) {
@@ -202,9 +232,6 @@ void loadConfig(){
     serializeJson(doc, configFile);
     configFile.close();
   }
-//hard code for now
-config.SAMPLE_PERIOD = 120;
-config.SEA_LEVEL_PRESSURE = 1020.20;
 }
 
 void updateTimeFromFile(void){
@@ -217,11 +244,10 @@ void updateTimeFromFile(void){
     conf_file.close();
     DateTime now = convert_fatfs_time(cdate,ctime);
     DEBUG_SERIAL.printf("Updating time to: %s\n",now.timestamp().c_str());
-    rtc_internal.setDate(now.day(),now.month(),(uint8_t) (now.year()-2000));
-    rtc_internal.setTime(now.hour(),now.minute(),now.second());
-    //rtc.adjust(now);
+    rtc.setEpoch(now.unixtime(),false);
     delay(1000);
     fatfs.remove(TIME_FILE_NAME);
+    fatfs.cacheClear();
   }else {
     loadConfig();
   }
@@ -263,12 +289,14 @@ void initMassStorage(){
 
 
 void initFlash(){
+  pinMode(5, OUTPUT); // initialize CS pin;
 
   if (!flash.begin(possible_devices)) {
     DEBUG_SERIAL.println("Error, failed to initialize flash chip!");
     while(1) delay(100);
   }
-  DEBUG_SERIAL.print("Flash chip JEDEC ID: 0x"); Serial.println(flash.getJEDECID(), HEX);
+  DEBUG_SERIAL.print("Flash chip JEDEC ID: 0x"); 
+  DEBUG_SERIAL.println(flash.getJEDECID(), HEX);
 
   // First call begin to mount the filesystem.  Check that it returns true
   // to make sure the filesystem was mounted.
@@ -283,42 +311,39 @@ void initFlash(){
 }
 
 
-void button_pressed(){
-  if ((millis() - lastDebounceTime) > debounceDelay) {
-    if((millis() - lastDebounceTime) < 1000){
-        Serial.println("Button double clicked: Resetting");
-        NVIC_SystemReset();   
-    }
-    else {
-      Serial.println("Button pressed!");
-    }
-    
-  }
-  lastDebounceTime = millis();
-}
-
 void initRTC(){
-
+  Serial.println("Preparing to initialize RTC!");
+  delay(1000);
   if (! rtc.begin()) {
-    DEBUG_SERIAL.println("Couldn't find RTC, using internal");
-    rtc_internal.begin();
+    DEBUG_SERIAL.println("Couldn't find RTC!");
+    // rtc_internal.begin();
   }
   else {
-    rtc.disable32K();
-    rtc.writeSqwPinMode(DS3231_OFF);
+    DEBUG_SERIAL.println("Connected to RTC");
+    rtc.updateTime();
+    DEBUG_SERIAL.printf("RTC Time is %s",rtc.stringTime8601TZ());
   }
-
 }
 
 void initAltimeter(){
-
+  DEBUG_SERIAL.println("Connecting to Altimeter...");
   if (!bmp.begin_I2C()) {
     DEBUG_SERIAL.println("Could not find sensor. Check wiring.");
-    while(1);
   }
-  // bmp.setPressureOversampling(BMP3_OVERSAMPLING_4X);
-  // bmp.setIIRFilterCoeff(BMP3_IIR_FILTER_COEFF_3);
-  bmp.setOutputDataRate(BMP3_ODR_0_05_HZ);  
+  else {
+    // bmp.setPressureOversampling(BMP3_OVERSAMPLING_4X);
+    // bmp.setIIRFilterCoeff(BMP3_IIR_FILTER_COEFF_3);
+    bmp.setOutputDataRate(BMP3_ODR_0_05_HZ);  
+  }
+
+}
+
+void initVEML(){
+  DEBUG_SERIAL.println("Connecting to VEML7700...");
+  if(veml.begin()){
+    DEBUG_SERIAL.printf("Current LUX: %0.1f\n", veml.readLux(VEML_LUX_AUTO));
+  }
+
 
 }
 #ifdef DEBUG_DISPLAY
@@ -341,50 +366,45 @@ void initDisplay(){
 #endif
 
 void printConfig(){
-  Serial.printf("Sample Period: %d seconds\nSea Level Pressure: %0.2f\nCurrent Time: %s\n",config.SAMPLE_PERIOD,config.SEA_LEVEL_PRESSURE,rtc.now().timestamp().c_str());
-}
-
-void saveConfig(CONFIG config){
-  //Do nothing
+  rtc.updateTime();
+  Serial.printf("Sample Period: %d seconds\nSea Level Pressure: %0.2f\nCurrent Time: %s\n",config.SAMPLE_PERIOD,config.SEA_LEVEL_PRESSURE,rtc.stringTime8601TZ());
 }
 
 
 void setup() {
+
   pinMode(13, OUTPUT); // initialize digital pin 13 (LED) as an output.
-  initFlash();
-  #if DEBUG == true
   Serial.begin(9600);
-  delay(3000);
-  #endif 
+  initFlash();
+
   for(int i=0; i < 10; i ++){
     digitalWrite(13, HIGH);   // turn the LED on (HIGH is the voltage level)
     delay(300);              // wait for a 1/3 second
     digitalWrite(13, LOW);    // turn the LED off by making the voltage LOW
     delay(300);              // wait for a 1/3 second
   }
+  digitalWrite(13, HIGH);    // turn the LED off by making the voltage LOW
+
+
+  Wire.begin();
+  Serial.println("Starting up");
+
 
   #ifdef DEBUG_DISPLAY
   initDisplay(); // Only for Debugging Purposes
   #endif
+
   initRTC();
   initAltimeter();
-  
+  initVEML();
+  Serial.println("Conducting Self-Test");
 
-  pinMode(6, INPUT_PULLUP);
+  powerOnSelfTest();
+  Serial.println("Preparing to load configuration");
   loadConfig();
-
-  attachInterrupt(digitalPinToInterrupt(6), button_pressed, FALLING);
-  LowPower.attachInterruptWakeup(6, button_pressed, FALLING);
-
   // setup timer counter
-  for (size_t i = 0; i < 5; i++)
-  {
-    digitalWrite(13, HIGH);   // turn the LED on (HIGH is the voltage level)
-    delay(150);              // wait for a 1/3 second
-    digitalWrite(13, LOW);    // turn the LED off by making the voltage LOW
-    delay(150);              // wait for a 1/3 second
-  }
-  digitalWrite(13, HIGH);   // turn the LED on (HIGH is the voltage level)
+  digitalWrite(13, HIGH);   // turn the LED OFF (HIGH is the voltage level)
+  Serial.println("Setup complete!");
 
 
 }
@@ -406,8 +426,8 @@ void displayStatus( char *statusStr){
 }
 #endif
 DateTime checkRTC(){
-  if(rtc.begin()){
-    return rtc.now();
+  if(rtc.updateTime()){
+    return DateTime(rtc.getEpoch());
   }
   else {
     return DateTime(rtc_internal.getEpoch());
@@ -428,9 +448,9 @@ void saveDataPoint(DataPacket dp){
   // Check that the file opened successfully and write a line to it.
   if (dataFile) {
     if(initializeFile){
-      dataFile.print("Timestamp,Altitude(m),Light Sensor\r\n");
+      dataFile.print("Timestamp,Altitude(m),Temperature,Light Sensor\r\n");
     }
-    dataFile.printf("%s,%0.2f,%ld\r\n",DateTime(dp.timestamp).timestamp().c_str(), dp.altitude, dp.luminance);
+    dataFile.printf("%s,%0.2f,%0.1f,%0.1f\r\n",DateTime(dp.timestamp).timestamp().c_str(), dp.altitude,dp.temperature, dp.luminance);
 
     dataFile.close();
     Serial.println("Wrote new measurement to data file!");
@@ -442,39 +462,25 @@ void saveDataPoint(DataPacket dp){
 
 }
 
-void exportData(){
-  // flash.powerUp();
-  // nSamples = flash.readULong(N_SAMPLES_ADDRESS);  
-
-  // Serial.printf("Timestamp,Altitude(m),Light Sensor\r\n");
-  // for(uint32_t n=0; n < nSamples; n++){
-  //     uint32_t _packetAddress = 4096 + sizeof(DataPacket) * n;
-  //     DataPacket dp;
-  //     flash.readAnything(_packetAddress,dp);
-  //     Serial.printf("%s,%0.2f,%ld\r\n",DateTime(dp.timestamp).timestamp().c_str(), dp.altitude, dp.luminance);
-  // }
-  // flash.powerDown();
-}
-
 
 void takeMeasurement(){
 
   uint32_t sampleStartTime = millis();
-  analogReadResolution(12);
 
   DataPacket dp;
-  uint16_t lightSensorValue = analogRead(A0);
   DateTime dt = checkRTC();
   float altitude = checkAltimeter();
+  float temperature = bmp.readTemperature();
 
-  dp.luminance = lightSensorValue;
+  dp.luminance = veml.readLux(VEML_LUX_AUTO);
   dp.timestamp = dt.unixtime();
+  dp.temperature = temperature;
   dp.altitude = altitude;
 
   //Send to Serial Port for Debugging
   char timeStr[40];
   sprintf(timeStr, "%d-%02d-%02dT%02d:%02d:%02d", dt.year(),dt.month(),dt.day(),dt.hour(),dt.minute(),dt.second());
-  DEBUG_SERIAL.printf("Timestamp: %s | Altitude: %0.2f meters | Light Sensor: %ld",timeStr, altitude, lightSensorValue);
+  DEBUG_SERIAL.printf("Timestamp: %s | Altitude: %0.2f meters | Light Sensor: %ld",timeStr, dp.altitude, dp.luminance);
   DEBUG_SERIAL.println();
 
   #ifdef DEBUG_DISPLAY
@@ -488,77 +494,6 @@ void takeMeasurement(){
   DEBUG_SERIAL.printf("Collection and saving of sample took %dms\n",(millis()-sampleStartTime));
 }
 
-
-void setConfigTime(){
-  Serial.println("Enter current time as an ISO8601 string (e.g. 2023-04-30T13:21:00):");
-  String isoTimeStr = Serial.readStringUntil('\n');
-  const char *isoTime = isoTimeStr.c_str();
-  DateTime now = DateTime(isoTime);
-  rtc.adjust(DateTime(isoTime));
-  rtc_internal.setDate(now.day(),now.month(),now.year());
-  rtc_internal.setTime(now.hour(),now.minute(),now.second());
-
-  delay(500);
-  Serial.printf("\nCurrent Time (external) is now: %s\n", rtc.now().timestamp().c_str());
-  Serial.printf("\nCurrent Time (internal) is now: %d-%02d-%02dT%02d:%02d:%02d\n", rtc_internal.getYear(),rtc_internal.getMonth(),rtc_internal.getDay(),rtc_internal.getHours(),rtc_internal.getMinutes(),rtc_internal.getSeconds());
-
-}
-
-void setSampleInterval(){
-    Serial.println("Enter new sample period in seconds:");
-    String sampleRateStr = Serial.readStringUntil('\n');
-    uint32_t newSampleRate = atoi(sampleRateStr.c_str());
-    if(newSampleRate > 0){
-      config.SAMPLE_PERIOD = newSampleRate*1000;
-      Serial.printf("Sample period has been set to: %d\n",config.SAMPLE_PERIOD);
-    }
-    else {
-      Serial.printf("Invalid sample period: %d seconds\n",newSampleRate);
-    }
-    saveConfig(config);
-
-}
-
-void setSeaLevelPressure(){
-    Serial.println("Enter new Sea Level Pressure in hPa (e.g. 1020.20):");
-    String seaLevelPressure = Serial.readStringUntil('\n');
-    float updatedPressure = atof(seaLevelPressure.c_str());
-    if(updatedPressure > 800.0){
-      config.SEA_LEVEL_PRESSURE = updatedPressure;
-      Serial.printf("Sea Level Pressure has been set to: %0.2f; Current Alititude: %0.2f m\n",config.SEA_LEVEL_PRESSURE,checkAltimeter());
-    }
-    else {
-      Serial.printf("Invalid Sea Level Pressure: %f hPa\n",updatedPressure);
-    }
-    saveConfig(config);
-
-}
-
-
-void printConfigHelp(){
-  Serial.println("Available Commands:");
-  for(int i=0; i < 80; i++) Serial.print("-");
-  Serial.println("SET_TIME: Set time on the real time clock");
-  Serial.println("SET_SAMPLE_INTERVAL: Set the sample interval in seconds");
-  Serial.println("SET_SEA_LEVEL_PRESSURE: Set the sea level pressure in hPA");
-  Serial.println("EXPORT_DATA: Print saved data to Serial console in CSV format");
-  Serial.println("PRINT_CONFIG: Display current configuration");
-  Serial.println("HELP: Display this message");
-  Serial.println("EXIT: Resume Sampling");
-  Serial.println();
-}
-
-void eraseData(){
-  // flash.powerUp();
-  // nSamples = 0;
-  // flash.eraseSection(0,sizeof(nSamples) + sizeof(CONFIG));
-  // if(flash.writeULong(N_SAMPLES_ADDRESS,nSamples) && flash.writeAnything(CONFIG_DATA_ADDRESS,config)){
-  //   DEBUG_SERIAL.printf("Wrote updated nSamples %ld to Flash\n",nSamples);
-  // }
-  // flash.powerDown();
-
-}
-
 // the loop function runs over and over again forever
 void loop() {
 
@@ -567,13 +502,17 @@ void loop() {
     delay(300);
     digitalWrite(13, HIGH);  
     delay(300);  
+    if((millis() - configTime) > CONFIG_MODE_TIMEOUT){
+      STATE = STATE_RECORDING;
+    }
+
   } else {
       digitalWrite(13, LOW);    
       takeMeasurement();
       digitalWrite(13, HIGH);    
       LowPower.deepSleep(config.SAMPLE_PERIOD*1000);
   }
-
+  
 
 
 }

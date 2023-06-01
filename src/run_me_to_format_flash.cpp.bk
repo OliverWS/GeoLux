@@ -34,7 +34,7 @@
 #include "diskio.h"
 
 // up to 11 characters
-#define DISK_LABEL    "P123"
+#define DISK_LABEL    "GEOLUX"
 static const SPIFlash_Device_t possible_devices[] = {W25Q128JV_PM};
 
 // for flashTransport definition
